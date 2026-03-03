@@ -1,0 +1,27 @@
+# Archivos temporales
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+*.egg-info/
+dist/
+build/
+
+# Carpetas de descargas y temporales
+descargas/
+ffmpeg/
+*.zip
+*.mp3
+*.jpg
+*.ico
+*.ini
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo

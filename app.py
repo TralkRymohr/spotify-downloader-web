@@ -12,11 +12,11 @@ import tempfile
 import shutil
 import logging
 import base64
+import subprocess
 from io import BytesIO
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, render_template_string, session
-from flask import after_this_request
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 # -------------------- IMPORTACIONES DE DEPENDENCIAS --------------------
 try:
     from spotify_scraper import SpotifyClient
-    import yt_dlp
     from mutagen.mp3 import MP3
     from mutagen.id3 import (
         ID3, APIC, TIT2, TPE1, TPE2, TALB, TDRC,
@@ -123,53 +122,69 @@ def obtener_caratula_bytes(cancion: Dict) -> Optional[bytes]:
 
 def descargar_audio(consulta: str, intentos=2, cookie_content: Optional[str] = None) -> Optional[bytes]:
     """
-    Descarga audio usando yt-dlp. Si se proporciona cookie_content, crea un archivo temporal
-    con las cookies y lo usa.
+    Descarga audio usando el binario estático de yt-dlp.
+    El binario debe estar presente en la raíz del proyecto (./yt-dlp).
     """
     timestamp = int(time.time())
     temp_name = f"temp_{timestamp}"
-    outtmpl = os.path.join(DOWNLOAD_FOLDER, f"{temp_name}.%(ext)s")
+    output_template = os.path.join(DOWNLOAD_FOLDER, f"{temp_name}.%(ext)s")
     
-    # Preparar opciones base
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "default_search": "ytsearch1",
-        "outtmpl": outtmpl,
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
-        "quiet": True,
-        "retries": 3,
-        "fragment_retries": 3,
-        "skip_unavailable_fragments": True,
-    }
+    # Ruta al binario de yt-dlp (se descarga durante el build)
+    yt_dlp_bin = "./yt-dlp"
+    if not os.path.exists(yt_dlp_bin):
+        # Intentar en el PATH por si acaso
+        yt_dlp_bin = "yt-dlp"
     
-    # Si hay cookies, crear archivo temporal
+    # Preparar el comando base
+    cmd = [
+        yt_dlp_bin,
+        "--format", "bestaudio/best",
+        "--default-search", "ytsearch1",
+        "--output", output_template,
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", "192",
+        "--quiet",
+        "--retries", "3",
+        "--fragment-retries", "3",
+        "--skip-unavailable-fragments",
+        # Forzar cliente android para evitar problemas
+        "--extractor-args", "youtube:player_client=android,web",
+        consulta
+    ]
+    
+    # Si hay cookies, crear archivo temporal y agregar opción
     cookie_file_path = None
     if cookie_content and cookie_content.strip():
         try:
-            # Crear archivo temporal (se eliminará al final de la función)
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
                 f.write(cookie_content)
                 cookie_file_path = f.name
-            ydl_opts['cookiefile'] = cookie_file_path
-            logger.info(f"🍪 Usando cookies proporcionadas por el usuario")
+            cmd.extend(["--cookies", cookie_file_path])
+            logger.info("🍪 Usando cookies proporcionadas por el usuario")
         except Exception as e:
             logger.error(f"Error al escribir archivo de cookies: {e}")
     
     for intento in range(1, intentos + 1):
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([consulta])
+            logger.info(f"Intento {intento}: usando yt-dlp binario con cliente android")
+            # Ejecutar el comando
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            # Buscar el archivo MP3 generado
             mp3_path = os.path.join(DOWNLOAD_FOLDER, f"{temp_name}.mp3")
             if os.path.exists(mp3_path):
                 with open(mp3_path, "rb") as f:
                     data = f.read()
                 os.remove(mp3_path)
                 return data
-        except Exception as e:
-            logger.warning(f"⚠️ Intento {intento}/{intentos} falló: {e}")
+            else:
+                logger.error("No se generó el archivo MP3")
+                logger.error(f"Salida de yt-dlp: {result.stdout}")
+                logger.error(f"Error de yt-dlp: {result.stderr}")
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"⚠️ Intento {intento}/{intentos} falló: {e.stderr}")
             time.sleep(3)
         finally:
-            # Limpiar archivo de cookies después de cada intento (si se creó)
             if cookie_file_path and os.path.exists(cookie_file_path):
                 try:
                     os.remove(cookie_file_path)

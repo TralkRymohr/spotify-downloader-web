@@ -3,93 +3,24 @@
 
 import os
 import sys
-import subprocess
 import time
 import re
 import requests
 import hashlib
 import zipfile
-import threading
-import webbrowser
-import platform
+import tempfile
 import shutil
+import logging
+import base64
 from io import BytesIO
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
-from flask import Flask, request, jsonify, send_file, render_template_string, after_this_request
+from flask import Flask, request, jsonify, send_file, render_template_string, session
+from flask import after_this_request
 
-# -------------------- AUTOINSTALACIÓN DE DEPENDENCIAS --------------------
-def instalar_dependencias():
-    """Instala automáticamente los paquetes Python necesarios."""
-    dependencias = ['flask', 'spotifyscraper', 'yt-dlp', 'mutagen', 'requests', 'pillow']
-    for dep in dependencias:
-        try:
-            __import__(dep.replace('-', '_'))
-        except ImportError:
-            print(f"📦 Instalando {dep}...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", dep])
-
-# Ejecutar autoinstalación al inicio (solo en local)
-if os.environ.get('RENDER') is None and os.environ.get('DYNO') is None:
-    instalar_dependencias()
-
-# -------------------- VERIFICACIÓN DE FFMPEG --------------------
-def verificar_ffmpeg():
-    """Verifica si FFmpeg está disponible; si no, lo descarga para Windows."""
-    try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-        print("✅ FFmpeg encontrado.")
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        if platform.system() == 'Windows':
-            print("⚠️ FFmpeg no encontrado. Intentando descargar automáticamente...")
-            return descargar_ffmpeg_windows()
-        else:
-            print("❌ FFmpeg no está instalado. En Linux/Mac, instálalo manualmente:")
-            print("   sudo apt install ffmpeg  (Ubuntu/Debian)")
-            print("   brew install ffmpeg      (Mac)")
-            return False
-
-def descargar_ffmpeg_windows():
-    """Descarga FFmpeg para Windows y lo agrega al PATH."""
-    ffmpeg_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-    ffmpeg_zip = "ffmpeg.zip"
-    ffmpeg_dir = os.path.join(os.getcwd(), "ffmpeg")
-    
-    try:
-        # Descargar
-        print("⬇️ Descargando FFmpeg...")
-        r = requests.get(ffmpeg_url, stream=True)
-        with open(ffmpeg_zip, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        # Extraer
-        print("📦 Extrayendo...")
-        with zipfile.ZipFile(ffmpeg_zip, 'r') as zip_ref:
-            zip_ref.extractall(ffmpeg_dir)
-        
-        # Buscar la carpeta bin
-        for root, dirs, files in os.walk(ffmpeg_dir):
-            if 'ffmpeg.exe' in files:
-                ffmpeg_bin = root
-                break
-        else:
-            raise Exception("No se encontró ffmpeg.exe en el zip")
-        
-        # Agregar al PATH de la sesión actual
-        os.environ["PATH"] += os.pathsep + ffmpeg_bin
-        print(f"✅ FFmpeg instalado en: {ffmpeg_bin}")
-        os.remove(ffmpeg_zip)
-        return True
-    except Exception as e:
-        print(f"❌ Error descargando FFmpeg: {e}")
-        return False
-
-# Verificar FFmpeg al inicio (solo local, en servidores se asume instalado)
-if os.environ.get('RENDER') is None and os.environ.get('DYNO') is None:
-    if not verificar_ffmpeg():
-        print("⚠️ La descarga de audio podría fallar sin FFmpeg.")
+# Configurar logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # -------------------- IMPORTACIONES DE DEPENDENCIAS --------------------
 try:
@@ -102,7 +33,8 @@ try:
     )
     from PIL import Image
 except ImportError as e:
-    print(f"❌ Error importando dependencias: {e}")
+    logger.error(f"Falta dependencia: {e}")
+    logger.error("Ejecuta: pip install -r requirements.txt")
     sys.exit(1)
 
 # -------------------- CONFIGURACIÓN DE CARPETAS --------------------
@@ -112,7 +44,8 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(CARATULAS_TEMP, exist_ok=True)
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # Límite 100MB para subidas
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # Límite 100MB
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')  # Necesario para sesiones
 
 # -------------------- FUNCIONES DE UTILIDAD --------------------
 def sanitizar_nombre(texto: str) -> str:
@@ -123,50 +56,37 @@ def sanitizar_nombre(texto: str) -> str:
     return texto or "sin_nombre"
 
 def obtener_info_spotify(url: str) -> Tuple[str, Optional[str], List[Dict]]:
-    """
-    Obtiene información de una URL de Spotify (playlist, álbum o track).
-    Devuelve: (nombre_principal, imagen_principal_url, lista_canciones)
-    """
-    print(f"🔍 Extrayendo metadatos de: {url}")
+    """Obtiene metadatos de una URL de Spotify (playlist, álbum o track)"""
+    logger.info(f"Extrayendo metadatos de: {url}")
     client = SpotifyClient()
-    data = None
-    nombre = "Spotify"
-    imagen_url = None
-    canciones = []
-
     try:
         if "playlist" in url:
             data = client.get_playlist_info(url)
             nombre = data.get("name", "Playlist sin nombre")
             images = data.get("images", [])
-            if images:
-                imagen_url = images[-1].get("url")
+            imagen_url = images[-1].get("url") if images else None
             items = data.get("tracks", [])
-            for item in items:
-                track = item.get("track", item)
-                canciones.append(extraer_info_track(track))
+            canciones = [extraer_info_track(item.get("track", item)) for item in items]
         elif "album" in url:
             data = client.get_album_info(url)
             nombre = data.get("name", "Álbum sin nombre")
             images = data.get("images", [])
-            if images:
-                imagen_url = images[0].get("url")
+            imagen_url = images[0].get("url") if images else None
             tracks = data.get("tracks", [])
-            for track in tracks:
-                canciones.append(extraer_info_track(track))
+            canciones = [extraer_info_track(track) for track in tracks]
         elif "track" in url:
             data = client.get_track_info(url)
             nombre = data.get("name", "Canción sin nombre")
-            canciones.append(extraer_info_track(data))
+            canciones = [extraer_info_track(data)]
+            imagen_url = canciones[0].get("cover_url") if canciones else None
         else:
             raise ValueError("URL no soportada. Debe ser de playlist, álbum o track.")
+        return nombre, imagen_url, canciones
     finally:
         client.close()
-    
-    return nombre, imagen_url, canciones
 
 def extraer_info_track(track: Dict) -> Dict:
-    """Extrae los campos relevantes de un track de Spotify"""
+    """Extrae campos relevantes de un track de Spotify"""
     nombre = track.get("name", "")
     artista = track.get("artists", [{}])[0].get("name", "")
     album = track.get("album", {}).get("name", "")
@@ -186,11 +106,11 @@ def extraer_info_track(track: Dict) -> Dict:
         "track_number": track_number,
         "cover_url": cover_url,
         "id_spotify": track.get("id"),
-        "genre": "Pop"  # Podríamos obtenerlo del álbum si existe
+        "genre": "Pop"  # Podría mejorarse obteniendo género del álbum si existe
     }
 
 def obtener_caratula_bytes(cancion: Dict) -> Optional[bytes]:
-    """Obtiene los bytes de la carátula (primero Spotify, luego iTunes)"""
+    """Obtiene la carátula desde Spotify (o fallback a iTunes)"""
     if cancion.get("cover_url"):
         try:
             r = requests.get(cancion["cover_url"], timeout=10)
@@ -198,40 +118,19 @@ def obtener_caratula_bytes(cancion: Dict) -> Optional[bytes]:
                 return r.content
         except:
             pass
-    # Fallback a iTunes
-    return descargar_caratula_itunes(cancion)
-
-def descargar_caratula_itunes(cancion: Dict) -> Optional[bytes]:
-    try:
-        artista = requests.utils.quote(cancion["artista"])
-        nombre = requests.utils.quote(cancion["nombre"])
-        url = f"https://itunes.apple.com/search?term={artista}+{nombre}&entity=song&limit=1"
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if data["resultCount"] > 0:
-                result = data["results"][0]
-                artwork = result.get("artworkUrl100")
-                if artwork:
-                    artwork = artwork.replace("100x100", "600x600")
-                    img_data = requests.get(artwork, timeout=10).content
-                    # Actualizar metadatos faltantes
-                    if not cancion.get("album") and result.get("collectionName"):
-                        cancion["album"] = result["collectionName"]
-                    if not cancion.get("track_number") and result.get("trackNumber"):
-                        cancion["track_number"] = result["trackNumber"]
-                    if result.get("primaryGenreName"):
-                        cancion["genre"] = result["primaryGenreName"]
-                    return img_data
-    except Exception as e:
-        print(f"   ⚠️ iTunes error: {e}")
+    # Fallback a iTunes (opcional, puedes desactivarlo si quieres)
     return None
 
-def descargar_audio(consulta: str, intentos=2) -> Optional[bytes]:
-    """Descarga el audio y devuelve los bytes del MP3"""
+def descargar_audio(consulta: str, intentos=2, cookie_content: Optional[str] = None) -> Optional[bytes]:
+    """
+    Descarga audio usando yt-dlp. Si se proporciona cookie_content, crea un archivo temporal
+    con las cookies y lo usa.
+    """
     timestamp = int(time.time())
     temp_name = f"temp_{timestamp}"
     outtmpl = os.path.join(DOWNLOAD_FOLDER, f"{temp_name}.%(ext)s")
+    
+    # Preparar opciones base
     ydl_opts = {
         "format": "bestaudio/best",
         "default_search": "ytsearch1",
@@ -242,6 +141,20 @@ def descargar_audio(consulta: str, intentos=2) -> Optional[bytes]:
         "fragment_retries": 3,
         "skip_unavailable_fragments": True,
     }
+    
+    # Si hay cookies, crear archivo temporal
+    cookie_file_path = None
+    if cookie_content and cookie_content.strip():
+        try:
+            # Crear archivo temporal (se eliminará al final de la función)
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+                f.write(cookie_content)
+                cookie_file_path = f.name
+            ydl_opts['cookiefile'] = cookie_file_path
+            logger.info(f"🍪 Usando cookies proporcionadas por el usuario")
+        except Exception as e:
+            logger.error(f"Error al escribir archivo de cookies: {e}")
+    
     for intento in range(1, intentos + 1):
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -253,12 +166,19 @@ def descargar_audio(consulta: str, intentos=2) -> Optional[bytes]:
                 os.remove(mp3_path)
                 return data
         except Exception as e:
-            print(f"   ⚠️ Intento {intento}/{intentos} falló: {e}")
+            logger.warning(f"⚠️ Intento {intento}/{intentos} falló: {e}")
             time.sleep(3)
+        finally:
+            # Limpiar archivo de cookies después de cada intento (si se creó)
+            if cookie_file_path and os.path.exists(cookie_file_path):
+                try:
+                    os.remove(cookie_file_path)
+                except:
+                    pass
     return None
 
 def añadir_metadatos_bytes(mp3_bytes: bytes, meta: Dict, caratula_bytes: Optional[bytes]) -> bytes:
-    """Añade metadatos a los bytes del MP3 y devuelve los bytes modificados"""
+    """Añade metadatos ID3 al MP3 y devuelve los bytes modificados"""
     temp_path = os.path.join(DOWNLOAD_FOLDER, f"temp_{hashlib.md5(mp3_bytes).hexdigest()[:8]}.mp3")
     with open(temp_path, "wb") as f:
         f.write(mp3_bytes)
@@ -275,8 +195,10 @@ def añadir_metadatos_bytes(mp3_bytes: bytes, meta: Dict, caratula_bytes: Option
     if not audio.tags:
         audio.add_tags()
 
+    # Eliminar carátulas existentes
     audio.tags.delall("APIC")
-
+    
+    # Añadir metadatos
     audio.tags["TIT2"] = TIT2(encoding=3, text=meta.get("nombre", "Desconocido"))
     audio.tags["TPE1"] = TPE1(encoding=3, text=meta.get("artista", "Desconocido"))
     audio.tags["TPE2"] = TPE2(encoding=3, text=meta.get("artista", "Desconocido"))
@@ -300,18 +222,13 @@ def añadir_metadatos_bytes(mp3_bytes: bytes, meta: Dict, caratula_bytes: Option
     return modified
 
 def crear_icono_y_desktop_ini(carpeta_destino: str, imagen_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Crea un archivo .ico y desktop.ini para personalizar la carpeta en Windows.
-    Devuelve (ruta_ico, ruta_desktop_ini) o (None, None) si falla.
-    """
+    """Crea archivo .ico y desktop.ini para personalizar carpeta en Windows"""
     try:
-        # Crear .ico
         img = Image.open(BytesIO(imagen_bytes))
         img = img.resize((256, 256), Image.Resampling.LANCZOS)
         ico_path = os.path.join(carpeta_destino, "cover.ico")
         img.save(ico_path, format='ICO', sizes=[(256, 256)])
         
-        # Crear desktop.ini
         ini_path = os.path.join(carpeta_destino, "desktop.ini")
         contenido = f"""[.ShellClassInfo]
 IconResource=cover.ico,0
@@ -323,15 +240,15 @@ FolderType=Music
         with open(ini_path, "w", encoding="utf-8") as f:
             f.write(contenido)
         
-        # Ocultar archivos en Windows
-        if platform.system() == 'Windows':
+        # Ocultar archivos en Windows (si se ejecuta localmente)
+        if os.name == 'nt':
             import ctypes
-            ctypes.windll.kernel32.SetFileAttributesW(ico_path, 2)  # Oculto
-            ctypes.windll.kernel32.SetFileAttributesW(ini_path, 2 | 4)  # Oculto + Sistema
+            ctypes.windll.kernel32.SetFileAttributesW(ico_path, 2)
+            ctypes.windll.kernel32.SetFileAttributesW(ini_path, 2 | 4)
         
         return ico_path, ini_path
     except Exception as e:
-        print(f"⚠️ Error creando icono/desktop.ini: {e}")
+        logger.warning(f"Error creando icono/desktop.ini: {e}")
         return None, None
 
 # -------------------- RUTAS WEB --------------------
@@ -374,13 +291,13 @@ HTML_TEMPLATE = """
         }
         .input-group {
             display: flex;
+            flex-direction: column;
             gap: 10px;
             max-width: 800px;
             margin: 0 auto 30px;
-            flex-wrap: wrap;
         }
         #url-input {
-            flex: 1;
+            width: 100%;
             padding: 15px 20px;
             border: none;
             border-radius: 50px;
@@ -389,10 +306,25 @@ HTML_TEMPLATE = """
             font-size: 16px;
             backdrop-filter: blur(5px);
             border: 1px solid rgba(255,255,255,0.2);
-            min-width: 250px;
         }
         #url-input:focus {
             outline: 2px solid #1db954;
+        }
+        .cookie-section {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        #cookies-input {
+            flex: 1;
+            padding: 10px;
+            border-radius: 10px;
+            background: rgba(255,255,255,0.1);
+            color: #fff;
+            border: 1px solid rgba(255,255,255,0.2);
+            font-family: monospace;
+            resize: vertical;
         }
         button {
             padding: 15px 30px;
@@ -404,6 +336,7 @@ HTML_TEMPLATE = """
             font-size: 16px;
             cursor: pointer;
             transition: transform 0.2s, background 0.2s;
+            white-space: nowrap;
         }
         button:hover {
             background: #1ed760;
@@ -412,6 +345,18 @@ HTML_TEMPLATE = """
         button:disabled {
             opacity: 0.5;
             cursor: not-allowed;
+        }
+        #fetch-btn {
+            background: #1db954;
+            margin-top: 10px;
+        }
+        #cookies-help {
+            color: #aaa;
+            font-size: 0.9rem;
+            margin-top: 5px;
+        }
+        #cookies-help a {
+            color: #1db954;
         }
         .loading {
             text-align: center;
@@ -548,6 +493,14 @@ HTML_TEMPLATE = """
         
         <div class="input-group">
             <input type="text" id="url-input" placeholder="Pega la URL de Spotify (canción, álbum o playlist)..." value="">
+            
+            <div class="cookie-section">
+                <textarea id="cookies-input" placeholder="Opcional: pega aquí el contenido de tu archivo cookies.txt (para evitar bloqueos de YouTube)" rows="3"></textarea>
+            </div>
+            <div id="cookies-help">
+                📌 ¿Necesitas cookies? Sigue <a href="https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies" target="_blank">esta guía</a> para exportar tu archivo cookies.txt (usa ventana de incógnito) y pégalo arriba. Las cookies solo se usan temporalmente y se eliminan tras la descarga.
+            </div>
+            
             <button id="fetch-btn">Obtener canciones</button>
         </div>
         
@@ -585,6 +538,8 @@ HTML_TEMPLATE = """
                 return;
             }
             
+            const cookies = document.getElementById('cookies-input').value.trim();
+            
             document.getElementById('loading').style.display = 'block';
             document.getElementById('error').style.display = 'none';
             document.getElementById('playlist-container').style.display = 'none';
@@ -594,7 +549,7 @@ HTML_TEMPLATE = """
                 const response = await fetch('/get_tracks', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url })
+                    body: JSON.stringify({ url, cookies })
                 });
                 
                 const data = await response.json();
@@ -658,6 +613,8 @@ HTML_TEMPLATE = """
             btn.disabled = true;
             btn.textContent = '⏳ Preparando ZIP...';
             
+            const cookies = document.getElementById('cookies-input').value.trim();
+            
             try {
                 const response = await fetch('/download_all', {
                     method: 'POST',
@@ -665,7 +622,8 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ 
                         tracks: currentTracks,
                         playlist_name: currentPlaylistName,
-                        playlist_cover: currentPlaylistCover
+                        playlist_cover: currentPlaylistCover,
+                        cookies: cookies
                     })
                 });
                 
@@ -699,6 +657,8 @@ HTML_TEMPLATE = """
             const track = currentTracks[index];
             if (!track) return;
             
+            const cookies = document.getElementById('cookies-input').value.trim();
+            
             button.disabled = true;
             button.textContent = '⏳ Descargando...';
             
@@ -706,7 +666,7 @@ HTML_TEMPLATE = """
                 const response = await fetch('/download_track', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ track })
+                    body: JSON.stringify({ track, cookies })
                 });
                 
                 if (!response.ok) {
@@ -741,19 +701,23 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def index():
+    logger.info("Solicitud a /")
     return render_template_string(HTML_TEMPLATE)
 
 @app.route('/get_tracks', methods=['POST'])
 def api_get_tracks():
     data = request.get_json()
     url = data.get('url')
+    cookies = data.get('cookies', '')
     if not url:
         return jsonify({'error': 'URL requerida'}), 400
     
     try:
-        nombre, imagen_url, canciones = obtener_info_spotify(url)
+        # Guardar cookies en la sesión (opcional, pero podemos usarlas directamente en cada descarga)
+        if cookies:
+            session['youtube_cookies'] = cookies
         
-        # Obtener base64 de la imagen principal
+        nombre, imagen_url, canciones = obtener_info_spotify(url)
         cover_base64 = None
         if imagen_url:
             try:
@@ -764,7 +728,6 @@ def api_get_tracks():
             except:
                 pass
         
-        # Obtener base64 de cada carátula para mostrarlas
         for cancion in canciones:
             if cancion.get('cover_url'):
                 try:
@@ -783,18 +746,20 @@ def api_get_tracks():
             'tracks': canciones
         })
     except Exception as e:
+        logger.error(f"Error en /get_tracks: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/download_track', methods=['POST'])
 def api_download_track():
     data = request.get_json()
     track = data.get('track')
+    cookies = data.get('cookies', session.get('youtube_cookies', ''))
     if not track:
         return jsonify({'error': 'Track requerido'}), 400
     
     try:
         consulta = f"{track['nombre']} {track['artista']} audio"
-        mp3_bytes = descargar_audio(consulta)
+        mp3_bytes = descargar_audio(consulta, cookie_content=cookies)
         if not mp3_bytes:
             return jsonify({'error': 'No se pudo descargar el audio'}), 500
         
@@ -808,6 +773,7 @@ def api_download_track():
             mimetype='audio/mpeg'
         )
     except Exception as e:
+        logger.error(f"Error en /download_track: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/download_all', methods=['POST'])
@@ -816,6 +782,7 @@ def api_download_all():
     tracks = data.get('tracks', [])
     playlist_name = data.get('playlist_name', 'descarga')
     playlist_cover_b64 = data.get('playlist_cover', '')
+    cookies = data.get('cookies', session.get('youtube_cookies', ''))
     
     if not tracks:
         return jsonify({'error': 'No hay canciones'}), 400
@@ -827,10 +794,9 @@ def api_download_all():
     zip_path = os.path.join(DOWNLOAD_FOLDER, f"{sanitizar_nombre(playlist_name)}.zip")
     
     try:
-        # Si hay imagen de la playlist, guardarla para incluir en el ZIP
+        # Guardar imagen de la playlist si existe
         playlist_cover_bytes = None
         if playlist_cover_b64 and playlist_cover_b64.startswith('data:image'):
-            import base64
             header, encoded = playlist_cover_b64.split(',', 1)
             playlist_cover_bytes = base64.b64decode(encoded)
             cover_path = os.path.join(temp_dir, "cover.jpg")
@@ -839,11 +805,11 @@ def api_download_all():
         
         # Descargar cada canción
         for i, track in enumerate(tracks, 1):
-            print(f"Procesando {i}/{len(tracks)}: {track['nombre']}")
+            logger.info(f"Procesando {i}/{len(tracks)}: {track['nombre']}")
             consulta = f"{track['nombre']} {track['artista']} audio"
-            mp3_bytes = descargar_audio(consulta)
+            mp3_bytes = descargar_audio(consulta, cookie_content=cookies)
             if not mp3_bytes:
-                print(f"   ⚠️ Error descargando {track['nombre']}, se omite")
+                logger.warning(f"   ⚠️ Error descargando {track['nombre']}, se omite")
                 continue
             
             caratula_bytes = obtener_caratula_bytes(track)
@@ -874,6 +840,7 @@ def api_download_all():
             mimetype='application/zip'
         )
     except Exception as e:
+        logger.error(f"Error en /download_all: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         # Limpiar archivos temporales
@@ -882,18 +849,7 @@ def api_download_all():
             os.remove(zip_path)
 
 # -------------------- MAIN --------------------
-def open_browser():
-    """Abre el navegador después de un pequeño retraso (solo local)"""
-    time.sleep(1)
-    webbrowser.open('http://localhost:5000')
-
 if __name__ == '__main__':
-    print("🎵 Iniciando servidor web Spotify Downloader...")
-    if os.environ.get('RENDER') is None and os.environ.get('DYNO') is None:
-        # Modo local: abrir navegador
-        threading.Thread(target=open_browser, daemon=True).start()
-        app.run(debug=True, host='0.0.0.0', port=5000)
-    else:
-        # Modo producción (Render/Heroku)
-        port = int(os.environ.get('PORT', 5000))
-        app.run(host='0.0.0.0', port=port)
+    # En producción, usar gunicorn
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
